@@ -122,7 +122,7 @@ def process_part(part_idx, file_path, total_bytes, py_exes):
         kept += 1
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, f"file{os.environ['FILE_ID']:03d}_part{part_idx}.parquet")
+    out_path = os.path.join(OUTPUT_DIR, f"file{file_id:03d}_part{part_idx}.parquet")
     if buf:
         pq.write_table(pa.Table.from_pylist(buf), out_path, compression="zstd")
         print(f"Part {part_idx}: Wrote {len(buf)} rows to {out_path}")

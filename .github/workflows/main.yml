@@ -2,25 +2,16 @@ name: Process SwallowCode-v2
 
 on:
   workflow_dispatch:
-    inputs:
-      batch_label:
-        description: 'Run label (A, B, C, retry, etc.)'
-        required: true
-        default: 'A'
-      files_per_job:
-        description: 'Files per job'
-        required: true
-        default: '5'
 
 jobs:
   process:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix:
-        # 30 offsets × 5 files/job = 150 files total
-        offset: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29]
+        job_id: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
 
     steps:
       - name: Free disk space
@@ -47,16 +38,9 @@ jobs:
       - name: Install dependencies
         run: pip install -q pyarrow huggingface_hub requests
 
-      - name: Compute this job's start file ID
-        id: compute
-        run: |
-          START=$(( ${{ matrix.offset }} * ${{ inputs.files_per_job }} ))
-          echo "start=$START" >> $GITHUB_OUTPUT
-          echo "This job will process files starting at $START"
-
-      - name: Process batch of ${{ inputs.files_per_job }} files
+      - name: Process slice
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          START_FILE_ID: ${{ steps.compute.outputs.start }}
-          BATCH_SIZE: ${{ inputs.files_per_job }}
+          JOB_ID: ${{ matrix.job_id }}
+          TOTAL_JOBS: 20
         run: python scripts/process_shard.py

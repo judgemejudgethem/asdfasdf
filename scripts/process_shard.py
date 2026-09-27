@@ -1,9 +1,12 @@
 """
-process_shard.py — Batch mode with local part-merge.
-Processes N files; each file is split into 4 byte-ranges, processed
-concurrently, then merged into a single {file_id}.parquet before upload.
+process_shard.py — Round-robin slice, merge-parts, single commit per job.
+
+Environment:
+  HF_TOKEN     - HF token
+  JOB_ID       - 0..TOTAL_JOBS-1 (this job's slice index)
+  TOTAL_JOBS   - total number of parallel jobs (default 20)
 """
-import os, json, subprocess, warnings, gc, time, glob
+import os, json, subprocess, warnings, gc, time, glob, re
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import pyarrow as pa
@@ -25,7 +28,7 @@ ROW_BATCH = 50_000
 DL_RETRIES = 5
 
 
-# ───── Utilities ─────
+# ─────── helpers ───────
 def list_jsonl_files():
     all_files = list_repo_files(REPO, repo_type="dataset",
                                 token=os.environ["HF_TOKEN"])
@@ -105,20 +108,19 @@ def ast_ok(code, py_exes):
 
 
 def process_part(part_idx, file_path, total_bytes, py_exes, file_id):
-    """Stream one byte-range part → one parquet part."""
+    """Stream one byte-range → one {file_id}_part{N}.parquet."""
     part_size = total_bytes // PARTS_PER_FILE
     start = part_idx * part_size
     end = (total_bytes - 1) if part_idx == PARTS_PER_FILE - 1 else (start + part_size - 1)
 
     local = f"/tmp/raw_{file_id:03d}_{part_idx}.jsonl"
     download_range(file_path, start, end, local)
-    print(f"  [p{part_idx}] downloaded {os.path.getsize(local)/1e9:.2f} GB")
+    print(f"    [p{part_idx}] downloaded {os.path.getsize(local)/1e9:.2f} GB")
 
     out_path = os.path.join(OUTPUT_DIR, f"file{file_id:03d}_part{part_idx}.parquet")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    writer = None
-    buf = []
+    writer, buf = None, []
     raw = kept = disc = 0
     is_first = (part_idx == 0)
     is_last = (part_idx == PARTS_PER_FILE - 1)
@@ -132,8 +134,7 @@ def process_part(part_idx, file_path, total_bytes, py_exes, file_id):
                 if not is_first:
                     continue
             if pending is not None:
-                cur = pending
-                pending = line
+                cur, pending = pending, line
             else:
                 pending = line
                 continue
@@ -192,83 +193,103 @@ def process_part(part_idx, file_path, total_bytes, py_exes, file_id):
     if buf:
         if writer is None:
             writer = pq.ParquetWriter(
-                out_path, pa.Table.from_pylist(buf).schema, compression="zstd")
+                out_path, pa.Table.from_pylist(buf).schema,
+                compression="zstd")
         writer.write_table(pa.Table.from_pylist(buf))
-        buf.clear()
-    if writer is not None:
+    if writer:
         writer.close()
 
     os.remove(local)
     gc.collect()
-    print(f"  [p{part_idx}] raw={raw:,} kept={kept:,} disc={disc:,}")
-    return {"raw": raw, "kept": kept, "disc": disc}
+    print(f"    [p{part_idx}] raw={raw:,} kept={kept:,} disc={disc:,}")
+    return {"kept": kept}
 
 
 def merge_parts(file_id):
-    """Combine file{ID}_part0..3.parquet → file{ID}.parquet. Delete parts."""
+    """Combine file{ID}_part0..N → file{ID}.parquet. Delete parts."""
     parts = sorted(glob.glob(f"{OUTPUT_DIR}/file{file_id:03d}_part*.parquet"))
     if not parts:
         return None
-    merged_path = f"{OUTPUT_DIR}/file{file_id:03d}.parquet"
-
-    # Stream-write merged parquet to keep RAM low
+    merged = f"{OUTPUT_DIR}/file{file_id:03d}.parquet"
     writer = None
     total_rows = 0
     for p in parts:
         tbl = pq.read_table(p)
         if writer is None:
-            writer = pq.ParquetWriter(merged_path, tbl.schema, compression="zstd")
+            writer = pq.ParquetWriter(merged, tbl.schema, compression="zstd")
         writer.write_table(tbl)
         total_rows += tbl.num_rows
         del tbl
         gc.collect()
-    if writer is not None:
+    if writer:
         writer.close()
-
-    # Delete parts
     for p in parts:
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-
-    return {"path": merged_path, "rows": total_rows,
-            "size_mb": os.path.getsize(merged_path) / 1e6}
+        try: os.remove(p)
+        except OSError: pass
+    return total_rows, os.path.getsize(merged) / 1e6
 
 
-def file_done(fid, existing):
-    """True if the merged file OR any part0 already exists on HF."""
-    return (any(f.endswith(f"file{fid:03d}.parquet") for f in existing)
-            or any(f.endswith(f"file{fid:03d}_part0.parquet") for f in existing))
+def completed_file_ids(existing):
+    """File IDs already merged OR with part0 already on HF."""
+    prefix = HF_SUBFOLDER + "/"
+    done = set()
+    for f in existing:
+        if not f.startswith(prefix):
+            continue
+        m = re.match(rf"{prefix}file(\d+)\.parquet$", f)
+        if m:
+            done.add(int(m.group(1)))
+            continue
+        m = re.match(rf"{prefix}file(\d+)_part0\.parquet$", f)
+        if m:
+            done.add(int(m.group(1)))
+    return done
 
 
-# ───── Main ─────
+def cleanup_file(fid):
+    for pat in [f"{OUTPUT_DIR}/file{fid:03d}_*",
+                f"/tmp/raw_{fid:03d}_*"]:
+        for x in glob.glob(pat):
+            try: os.remove(x)
+            except OSError: pass
+
+
+# ─────── main ───────
 def main():
-    start_id = int(os.environ["START_FILE_ID"])
-    batch = int(os.environ.get("BATCH_SIZE", "5"))
+    job_id = int(os.environ["JOB_ID"])
+    total_jobs = int(os.environ.get("TOTAL_JOBS", "20"))
+
     files = list_jsonl_files()
-    end_id = min(start_id + batch, len(files))
+    print(f"Total JSONL files in source: {len(files)}")
 
-    print(f"Job range: files {start_id}–{end_id-1} "
-          f"({end_id - start_id} of {len(files)} total)")
-
-    print("Checking HF for existing files...")
+    print("Checking HF for completed files...")
     existing = list_repo_files(HF_OUT, repo_type="dataset",
                                token=os.environ["HF_TOKEN"])
+    done = completed_file_ids(existing)
+    print(f"  completed: {len(done)}")
+
+    remaining = [i for i in range(len(files)) if i not in done]
+    print(f"  remaining: {len(remaining)}")
+
+    my_ids = remaining[job_id::total_jobs]
+    print(f"\nJob {job_id}/{total_jobs}: assigned {len(my_ids)} files")
+    if my_ids:
+        print(f"  files: {my_ids}")
+
+    if not my_ids:
+        print("Nothing to process. Exiting.")
+        return
 
     py_exes = []
     for f in ["/tmp/py311.txt", "/tmp/py313.txt", "/tmp/py314.txt"]:
         if os.path.exists(f):
             py_exes.append(open(f).read().strip())
 
-    processed = []
-    for fid in range(start_id, end_id):
-        if file_done(fid, existing):
-            print(f"[{fid:03d}] ✅ already on HF — skip")
-            continue
-
+    merged_shards = []
+    for fid in my_ids:
         target = files[fid]
-        print(f"\n[{fid:03d}] {target}")
+        print(f"\n{'='*60}\n[{fid:03d}] {target}\n{'='*60}")
+        cleanup_file(fid)
         try:
             size = get_file_size(target)
             print(f"  size: {size/1e9:.2f} GB → {PARTS_PER_FILE} parts")
@@ -277,46 +298,42 @@ def main():
                 futs = [ex.submit(process_part, i, target, size, py_exes, fid)
                         for i in range(PARTS_PER_FILE)]
                 stats = [f.result() for f in futs]
-
             kept = sum(s["kept"] for s in stats)
-            print(f"  parts done: kept={kept:,}. Merging...")
+            print(f"  parts complete: kept={kept:,}")
 
-            merged = merge_parts(fid)
-            if merged:
-                print(f"  ✅ file{fid:03d}: {merged['rows']:,} rows, "
-                      f"{merged['size_mb']:.1f} MB")
-                processed.append(fid)
+            m = merge_parts(fid)
+            if m:
+                rows, size_mb = m
+                print(f"  ✅ file{fid:03d}: {rows:,} rows, {size_mb:.1f} MB")
+                merged_shards.append(fid)
             else:
-                print(f"  ⚠️ nothing to merge for {fid}")
-
+                print(f"  ⚠️  nothing to merge for file{fid:03d}")
         except Exception as e:
-            print(f"  ❌ file{fid:03d} failed: {e}")
-            for pat in [f"{OUTPUT_DIR}/file{fid:03d}_*",
-                        f"/tmp/raw_{fid:03d}_*"]:
-                for x in glob.glob(pat):
-                    try: os.remove(x)
-                    except OSError: pass
+            print(f"  ❌ failed: {e}")
+            cleanup_file(fid)
 
-    if processed:
-        print(f"\n📤 Uploading {len(processed)} merged shards in one commit...")
+    # ─── ONE commit for everything this job produced ───
+    if merged_shards:
+        print(f"\n{'='*60}")
+        print(f"📤 Committing {len(merged_shards)} merged shards in ONE commit")
+        print(f"{'='*60}")
         create_repo(HF_OUT, repo_type="dataset", private=False,
                     exist_ok=True, token=os.environ["HF_TOKEN"])
         upload_folder(
             repo_id=HF_OUT, repo_type="dataset",
             folder_path=OUTPUT_DIR, path_in_repo=HF_SUBFOLDER,
             token=os.environ["HF_TOKEN"],
-            commit_message=f"Batch {processed[0]:03d}–{processed[-1]:03d} "
-                           f"({len(processed)} merged shards)",
+            commit_message=f"Job {job_id}: {len(merged_shards)} shards "
+                           f"(IDs {merged_shards[0]:03d}–{merged_shards[-1]:03d})",
         )
-        print(f"✅ Uploaded {len(processed)} shards in 1 commit")
+        print(f"✅ Committed {len(merged_shards)} shards")
 
-        # Cleanup local
-        for fid in processed:
+        for fid in merged_shards:
             for x in glob.glob(f"{OUTPUT_DIR}/file{fid:03d}*"):
                 try: os.remove(x)
                 except OSError: pass
     else:
-        print("\nNothing new to upload")
+        print("\nNo shards to commit.")
 
 
 if __name__ == "__main__":

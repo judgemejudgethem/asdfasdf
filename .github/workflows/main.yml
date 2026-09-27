@@ -1,0 +1,72 @@
+name: Process SwallowCode-v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: 'Batch ID (A, B, or C)'
+        required: true
+        default: 'A'
+      start_file_id:
+        description: 'First file ID (inclusive)'
+        required: true
+        default: '0'
+      end_file_id:
+        description: 'Last file ID (exclusive)'
+        required: true
+        default: '54'
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20  # Set to 20 for the free plan limit
+      matrix:
+        file_id: ${{ fromJSON(format('[0-{0}]', fromJSON(inputs.end_file_id) - 1)) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python 3.11, 3.13, 3.14 via uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv python install 3.11 3.12 3.13 3.14
+          uv python find 3.11 > /tmp/py311.txt
+          uv python find 3.13 > /tmp/py313.txt
+          uv python find 3.14 > /tmp/py314.txt
+
+      - name: Install dependencies
+        run: pip install -q pyarrow huggingface_hub requests
+
+      - name: Process file ${{ matrix.file_id }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          FILE_ID: ${{ matrix.file_id }}
+        run: python scripts/process_shard.py
+
+      - name: Upload to Hugging Face
+        if: success()
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          FILE_ID: ${{ matrix.file_id }}
+        run: |
+          python -c "
+          import os, glob
+          from huggingface_hub import create_repo, upload_folder
+          REPO = 'PERDYPTO/moe'
+          SUBFOLDER = 'swallowcode_v2'
+          FILE_ID = int(os.environ['FILE_ID'])
+          create_repo(repo_id=REPO, repo_type='dataset', private=False, exist_ok=True, token=os.environ['HF_TOKEN'])
+          files = glob.glob(f'/tmp/cleaned/file{FILE_ID:03d}_part*.parquet')
+          for f in files:
+              upload_folder(repo_id=REPO, repo_type='dataset', folder_path=os.path.dirname(f), path_in_repo=SUBFOLDER, allow_patterns=[os.path.basename(f)], token=os.environ['HF_TOKEN'], commit_message=f'Upload file {FILE_ID} parts')
+          print(f'Uploaded {len(files)} parts for file {FILE_ID}')
+          "

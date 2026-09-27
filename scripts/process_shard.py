@@ -271,10 +271,12 @@ def main():
     remaining = [i for i in range(len(files)) if i not in done]
     print(f"  remaining: {len(remaining)}")
 
-    my_ids = remaining[job_id::total_jobs]
+    # Deterministic slice: file `i` belongs to job `i % total_jobs`
+    my_ids = [i for i in remaining if i % total_jobs == job_id]
     print(f"\nJob {job_id}/{total_jobs}: assigned {len(my_ids)} files")
     if my_ids:
-        print(f"  files: {my_ids}")
+        preview = my_ids[:10] + (["..."] if len(my_ids) > 10 else [])
+        print(f"  files: {preview}")
 
     if not my_ids:
         print("Nothing to process. Exiting.")

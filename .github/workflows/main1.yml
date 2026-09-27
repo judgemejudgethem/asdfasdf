@@ -1,0 +1,39 @@
+name: Merge Existing SwallowCode Shards
+
+on:
+  workflow_dispatch:
+    inputs:
+      files_per_job:
+        description: 'File IDs per job'
+        required: true
+        default: '10'
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        offset: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q pyarrow huggingface_hub
+
+      - name: Compute range
+        id: c
+        run: |
+          PER_JOB=${{ inputs.files_per_job }}
+          START=$(( ${{ matrix.offset }} * PER_JOB ))
+          END=$(( START + PER_JOB ))
+          echo "start=$START" >> $GITHUB_OUTPUT
+          echo "end=$END" >> $GITHUB_OUTPUT
+
+      - name: Merge batch
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python scripts/merge_existing.py ${{ steps.c.outputs.start }} ${{ steps.c.outputs.end }}
